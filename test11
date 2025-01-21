@@ -272,9 +272,8 @@ def generate_frames(rtsp_link, yolo_model):
                         emp_id = None
 
                         if faces:
-                            face_recognition_result = recognize_faces(roi, faces, rtsp_link, area_name, similarity_threshold=0.3)
-                            if face_recognition_result:
-                                frame, name, emp_id, area_name, recognized = face_recognition_result
+                            frame, name, emp_id, area_name, recognized = recognize_faces(roi, faces, rtsp_link, area_name, similarity_threshold=0.3)
+                            if recognized:
                                 face_recognition_cache[track_id] = (name, emp_id, area_name, recognized)
                                 break
                     # Update detected objects
