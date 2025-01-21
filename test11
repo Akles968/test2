@@ -1,0 +1,360 @@
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import Float, create_engine, Column, Integer, String, LargeBinary, Text, DateTime, TIMESTAMP, func
+from sqlalchemy.orm import declarative_base
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.exc import OperationalError, ProgrammingError
+from pgvector.sqlalchemy import Vector
+from strongsort.strong_sort import StrongSORT
+from strongsort.utils.parser import get_config
+import uvicorn
+import insightface
+import psycopg2
+import base64
+import datetime
+import threading
+import pytz
+import torch
+import numpy as np
+import cv2
+from ultralytics import YOLO
+from pathlib import Path
+import json
+
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+tracking = True
+CONFIDENCE_THRESHOLD = 0.4
+WHITE = (255, 255, 255)
+OUTPUT_SIZE = (640, 640)
+YOLO_MODEL_PATH = "yolov8n.pt"
+# TRACKER_CONFIG_PATH = "config.yaml"
+TRACKER_WEIGHTS_PATH = "osnet_x0_25_market1501.pt"
+HOMOGRAPHY_PATH = "homography_matrix_640.txt"
+BACKGROUND_IMAGE_PATH = "new_cafeteria.jpg"
+
+app = FastAPI()
+
+face_model = insightface.app.FaceAnalysis()
+face_model.prepare(ctx_id=-1, det_size=(640, 640), det_thresh= .5)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+Base = declarative_base()
+# engine_ = create_engine('postgresql://postgres:postgres@172.16.200.43:32101/xenonstack')
+# Session_ = sessionmaker(bind=engine_)
+engine_ = create_engine('postgresql://postgres:postgres@10.0.0.210:5432/xenonai')
+Session_ = sessionmaker(bind=engine_)
+kolkata_zone = pytz.timezone('Asia/Kolkata')
+
+conn = psycopg2.connect(
+    dbname="mydb",
+    user="cvdemo",
+    password="cvdemo",
+    host="172.16.200.229",
+    port="31937"
+)
+
+class DetectedLog(Base):
+    __tablename__ = 'detected_logs'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    track_id = Column(String, nullable=False)
+    emp_id = Column(String, nullable=False)
+    name = Column(String, nullable=False)
+    area = Column(String, nullable=False)
+    start_time = Column(DateTime, nullable=False)
+    end_time = Column(DateTime, nullable=False)
+    time_period = Column(Float, nullable=False)
+
+    def __init__(self, track_id, emp_id, name, area, start_time, end_time, time_period):
+        self.track_id = track_id
+        self.emp_id = emp_id
+        self.name = name
+        self.area = area
+        self.start_time = start_time
+        self.end_time = end_time
+        self.time_period = time_period
+
+def create_table_if_needed(engine_url='postgresql+psycopg2://cvdemo:cvdemo@172.16.200.229:30878/mydb'):
+    try:
+        engine = create_engine(engine_url)
+        # Automatically creates the table if it doesn't exist
+        # Base.metadata.create_all(engine)
+        DetectedLog.__table__.create(engine, checkfirst=True)
+    except ProgrammingError as e:
+        if "relation \"detected_logs\" already exists" in str(e):
+            print("Table already exists, skipping creation.")
+        else:
+            raise
+
+create_table_if_needed()
+
+# Utility Functions
+def load_yolo_model(model_path="yolov8n.pt"):
+    return YOLO(model_path)
+
+def initialize_tracker(weights_path, device, max_age=150, fp16=False):
+    # config = get_config()
+    # config.merge_from_file(config_path)
+    return StrongSORT(model_weights=Path(weights_path), device=device, max_age=max_age, fp16=fp16)
+
+def load_homography_matrix(homography_file):
+    return np.loadtxt(homography_file)
+
+# def load_background_image(image_path):
+#     img = cv2.imread(image_path)
+#     if img is None:
+#         raise FileNotFoundError(f"Background image not found at {image_path}")
+#     return img
+
+# def transform_to_image(x, y, h_matrix):
+#     video_coords = np.array([[x, y, 1]]).T  # Homogeneous coordinates
+#     image_coords = np.dot(h_matrix, video_coords)
+#     image_coords /= image_coords[2]  # Normalize by z-coordinate
+#     return int(image_coords[0]), int(image_coords[1])
+
+def get_unique_color(track_id):
+    np.random.seed(int(track_id))
+    return tuple(np.random.randint(0, 255, 3).tolist())
+
+# def draw_dashed_line(image, start, end, color, thickness, dash_length=10):
+#     x1, y1 = start
+#     x2, y2 = end
+#     line_length = int(np.linalg.norm((x2 - x1, y2 - y1)))
+#     for i in range(0, line_length, dash_length * 2):
+#         start_pos = i / line_length
+#         end_pos = (i + dash_length) / line_length
+#         start_x = int(x1 + start_pos * (x2 - x1))
+#         start_y = int(y1 + start_pos * (y2 - y1))
+#         end_x = int(x1 + end_pos * (x2 - x1))
+#         end_y = int(y1 + end_pos * (x2 - y1))
+#         cv2.line(image, (start_x, start_y), (end_x, end_y), color, thickness)
+
+# def draw_dotted_line(image, start, end, color, radius=3):
+#     x1, y1 = start
+#     x2, y2 = end
+#     line_length = int(np.linalg.norm((x2 - x1, y2 - y1)))
+#     for i in range(0, line_length, radius * 4):
+#         t = i / line_length
+#         px = int(x1 + t * (x2 - x1))
+#         py = int(y1 + t * (x2 - y1))
+#         cv2.circle(image, (px, py), radius, color, -1)
+        
+yolo_model = load_yolo_model(YOLO_MODEL_PATH)
+tracker = initialize_tracker(TRACKER_WEIGHTS_PATH, DEVICE)
+h_matrix = load_homography_matrix(HOMOGRAPHY_PATH)
+# bg_image = load_background_image(BACKGROUND_IMAGE_PATH)
+
+class AsyncFrameCapture:
+    def __init__(self, rtsp_link):
+        self.rtsp_link = rtsp_link
+        self.cap = cv2.VideoCapture(rtsp_link)
+        self.frame = None
+        self.lock = threading.Lock()
+        self.condition = threading.Condition(self.lock)
+        self.running = True
+        self.thread = threading.Thread(target=self._capture_frames, daemon=True)
+        self.thread.start()
+
+    def _capture_frames(self):
+        while self.running:
+            success, frame = self.cap.read()
+            if frame is not None:
+                frame = cv2.resize(frame, (640,640))
+            if success:
+                with self.lock:
+                    self.frame = frame
+                    self.condition.notify_all()
+
+    def get_frame(self):
+        with self.lock:
+            return self.frame
+
+    def stop(self):
+        self.running = False
+        self.thread.join()
+        self.cap.release()
+
+class KnownFace(Base):
+    __tablename__ = 'employee_details'
+    id = Column(Integer, primary_key=True)
+    name = Column(String(255), nullable=False)
+    company = Column(String(255), nullable=True)
+    employee_id = Column(String(255), nullable=True)
+    department = Column(String(255), nullable=True)
+    email = Column(String(255), nullable=True)
+    phone_number = Column(String(255), nullable=True)
+    face_image_base64 = Column(Text, nullable=True)
+    seat = Column(String(10), nullable=True)
+    is_restricted_in = Column(Text, nullable=True)
+    embedding = Column(Vector(512), nullable=True)
+
+class Area(Base):
+    __tablename__ = 'cam_areas'
+    id = Column(Integer, primary_key=True)
+    name = Column(String(255))
+    rtsp = Column(String(255))
+
+def get_area_by_rtsp_url(rtsp_url):
+    with Session_() as session:
+        area = session.query(Area.name).filter(Area.rtsp == rtsp_url).first()
+        print(area)
+        return area[0]
+
+def create_fresh_frame_instance(rtsp_link):
+    if rtsp_link == "webcam":
+        rtsp_link = 0
+    cap = cv2.VideoCapture(rtsp_link)
+    cap.set(cv2.CAP_PROP_FPS, 10)
+    return AsyncFrameCapture
+
+def generate_frames(rtsp_link, yolo_model):
+    print("Inside generate_frames")
+    if rtsp_link == "webcam":
+        rtsp_link = 0
+        area_name = "IT_room"
+    else:
+        area_name = get_area_by_rtsp_url(rtsp_link)
+
+    fresh_frame = AsyncFrameCapture(rtsp_link)
+    detected_objects = {}
+    tracking_time = {}
+    face_recognition_cache = {}
+    tracked_ids = []
+
+    try:
+        while True:
+            frame = fresh_frame.get_frame()
+            if frame is not None:
+                # YOLO Predictions
+                detections = yolo_model.predict(frame, conf=CONFIDENCE_THRESHOLD, verbose=False)[0]
+                results = [
+                    [int(data[0]), int(data[1]), int(data[2]), int(data[3]), data[4], int(data[5])]
+                    for data in detections.boxes.data.tolist()
+                    if int(data[5]) == 0 and data[4] >= CONFIDENCE_THRESHOLD
+                ]
+
+                # Tracker Update
+                detection_tensor = torch.tensor(
+                    results, dtype=torch.float32, device=DEVICE
+                ) if results else torch.empty((0, 6), dtype=torch.float32, device=DEVICE)
+                tracks = tracker.update(detection_tensor, frame)
+
+                for track in tracks:
+                    if isinstance(track, np.ndarray):
+                        ltrb, track_id = track[:4], int(track[4])
+                        tracked_ids.append(track_id)
+                    else:
+                        ltrb, track_id = track.to_ltrb(), track.track_id
+                        tracked_ids.append(track_id)
+
+                    xmin, ymin, xmax, ymax = map(int, ltrb)
+                    x, y = (xmin + xmax) // 2, (ymin + ymax) // 2
+
+                    print("////////////face_recognition_cache/////////////// ", face_recognition_cache)
+                    # Track bounding boxes
+                    if track_id in face_recognition_cache:
+                        name, emp_id, area_name, recognized = face_recognition_cache[track_id]
+                    else:
+                        # Perform face recognition
+                        roi = frame[ymin:ymax, xmin:xmax]
+                        faces = face_model.get(roi)
+                        name = "Unknown"
+                        emp_id = None
+
+                        if faces:
+                            face_recognition_result = recognize_faces(roi, faces, rtsp_link, area_name, similarity_threshold=0.3)
+                            if face_recognition_result:
+                                frame, name, emp_id, area_name, recognized = face_recognition_result
+                                face_recognition_cache[track_id] = (name, emp_id, area_name, recognized)
+                                break
+                    # Update detected objects
+                    detected_objects[track_id] = {
+                        'bbox': [xmin, ymin, xmax, ymax],
+                        'name': name,
+                        'emp_id': emp_id,
+                        'area': area_name,
+                    }
+
+                    # Draw bounding box and labels
+                    color = get_unique_color(track_id)
+                    cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
+                    cv2.putText(frame, name, (xmin, ymin - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, WHITE, 2)
+
+                with open("detected_objects.json", "w") as f:
+                    json.dump(detected_objects, f, indent=4)
+                # Encode frame for streaming
+                ret, buffer = cv2.imencode('.jpg', frame)
+                if ret:
+                    yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+
+    except Exception as e:
+        print(f"Error in processing frame: {e}")
+    finally:
+        fresh_frame.stop()
+        print("Released video capture resource")
+
+
+def frame_to_base64(frame):
+    _, buffer = cv2.imencode('.jpg', frame)
+    return base64.b64encode(buffer).decode('utf-8')
+
+def recognize_faces(frame, faces, rtsp_link, area_name, similarity_threshold=0.1):
+    global latest_metadata, main_data
+    latest_metadata = []
+    main_data = []
+    recognized = False
+    cursor = conn.cursor()
+    face_count = len(faces)
+
+    if face_count==1:
+        face = faces[0]
+        embedding = face.embedding
+        embedding_list = embedding.tolist()
+        cursor.execute(
+            f"""SELECT employee_id, company, name, department, seat FROM employee_details
+             WHERE embedding <=> '{embedding_list}'<.6 order by embedding <=> '{embedding_list}' asc;"""
+        )
+        results = cursor.fetchone()
+        bbox = face['bbox'].astype(int)
+        recognized = False  
+        if results:
+            recognized = True
+            # recognized_count += 1 
+            emp_id, company, name, department, seat = results
+            label = f"{name} - {company}" if company else name
+            cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 255, 0), 2)
+            cv2.putText(frame, label, (bbox[0], bbox[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    
+            return frame, name, emp_id, area_name, recognized 
+        if not recognized:
+            cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 0, 255), 2)
+            cv2.putText(frame, "Unknown", (bbox[0], bbox[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            
+            return frame, "Unknown", None, area_name, recognized 
+
+
+@app.get("/")
+async def hello_world():
+    return PlainTextResponse("Hello, World!")
+
+@app.get("/video")
+async def video(yolo_model=yolo_model, rtsp_link: str = Query(..., description="RTSP link to stream video")):
+    try:
+        return StreamingResponse(generate_frames(rtsp_link, yolo_model), media_type='multipart/x-mixed-replace; boundary=frame')
+    except Exception as e:
+        print(f"Error in video streaming: {e}")
+        return JSONResponse(content={"error": "Internal server error"}, status_code=500)
+
+
+if __name__ == '__main__':
+    uvicorn.run(app, host="0.0.0.0", port=8000)
