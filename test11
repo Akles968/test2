@@ -51,7 +51,7 @@ app.add_middleware(
 Base = declarative_base()
 # engine_ = create_engine('postgresql://postgres:postgres@172.16.200.43:32101/xenonstack')
 # Session_ = sessionmaker(bind=engine_)
-engine_ = create_engine('postgresql://postgres:postgres@10.0.0.210:5432/xenonai')
+engine_ = create_engine('postgresql://cvdemo:cvdemo@172.16.200.229:31937/mydb')
 Session_ = sessionmaker(bind=engine_)
 kolkata_zone = pytz.timezone('Asia/Kolkata')
 
@@ -68,7 +68,7 @@ class DetectedLog(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     track_id = Column(String, nullable=False)
-    emp_id = Column(String, nullable=False)
+    emp_id = Column(String, nullable=True)
     name = Column(String, nullable=False)
     area = Column(String, nullable=False)
     start_time = Column(DateTime, nullable=False)
@@ -84,9 +84,8 @@ class DetectedLog(Base):
         self.end_time = end_time
         self.time_period = time_period
 
-def create_table_if_needed(engine_url='postgresql+psycopg2://cvdemo:cvdemo@172.16.200.229:30878/mydb'):
+def create_table_if_needed(engine):
     try:
-        engine = create_engine(engine_url)
         # Automatically creates the table if it doesn't exist
         # Base.metadata.create_all(engine)
         DetectedLog.__table__.create(engine, checkfirst=True)
@@ -96,7 +95,7 @@ def create_table_if_needed(engine_url='postgresql+psycopg2://cvdemo:cvdemo@172.1
         else:
             raise
 
-create_table_if_needed()
+create_table_if_needed(engine_)
 
 # Utility Functions
 def load_yolo_model(model_path="yolov8n.pt"):
@@ -151,7 +150,7 @@ def get_unique_color(track_id):
         
 yolo_model = load_yolo_model(YOLO_MODEL_PATH)
 tracker = initialize_tracker(TRACKER_WEIGHTS_PATH, DEVICE)
-h_matrix = load_homography_matrix(HOMOGRAPHY_PATH)
+# h_matrix = load_homography_matrix(HOMOGRAPHY_PATH)
 # bg_image = load_background_image(BACKGROUND_IMAGE_PATH)
 
 class AsyncFrameCapture:
@@ -227,6 +226,8 @@ def generate_frames(rtsp_link, yolo_model):
 
     fresh_frame = AsyncFrameCapture(rtsp_link)
     detected_objects = {}
+    global latest_metadata
+    latest_metadata = []
     tracking_time = {}
     face_recognition_cache = {}
     tracked_ids = []
@@ -260,7 +261,7 @@ def generate_frames(rtsp_link, yolo_model):
                     xmin, ymin, xmax, ymax = map(int, ltrb)
                     x, y = (xmin + xmax) // 2, (ymin + ymax) // 2
 
-                    print("////////////face_recognition_cache/////////////// ", face_recognition_cache)
+                    # print("////////////face_recognition_cache/////////////// ", face_recognition_cache)
                     # Track bounding boxes
                     if track_id in face_recognition_cache:
                         name, emp_id, area_name, recognized = face_recognition_cache[track_id]
@@ -272,25 +273,111 @@ def generate_frames(rtsp_link, yolo_model):
                         emp_id = None
 
                         if faces:
-                            frame, name, emp_id, area_name, recognized = recognize_faces(roi, faces, rtsp_link, area_name, similarity_threshold=0.3)
+                            name, emp_id, area_name, recognized = recognize_faces(roi, faces, rtsp_link, area_name, similarity_threshold=0.3)
                             if recognized:
                                 face_recognition_cache[track_id] = (name, emp_id, area_name, recognized)
                                 break
+                    current_time = datetime.datetime.now()
+                    if track_id not in tracking_time:
+                        tracking_time[track_id] = {'start_time': current_time, 'end_time': current_time}
+                    else:
+                        tracking_time[track_id]['end_time'] = current_time
+
+                    # Calculate time period for the current bounding box
+                    start_time = tracking_time[track_id]['start_time']
+                    end_time = tracking_time[track_id]['end_time']
+                    time_period = (end_time - start_time).total_seconds() / 60
+                    # start_time = start_time.time().strftime('%H:%M:%S')
+                    # end_time = end_time.time().strftime('%H:%M:%S')
                     # Update detected objects
-                    detected_objects[track_id] = {
-                        'bbox': [xmin, ymin, xmax, ymax],
-                        'name': name,
-                        'emp_id': emp_id,
-                        'area': area_name,
-                    }
+                    # detected_objects[track_id] = {
+                    #     'bbox': [xmin, ymin, xmax, ymax],
+                    #     'name': name,
+                    #     'emp_id': emp_id,
+                    #     'area': area_name,
+                    # }
+                    # detected_objects[track_id] = {
+                    #         'name': name,
+                    #         'emp_id': emp_id,
+                    #         'area': area_name,
+                    #         'start_time': start_time,
+                    #         'end_time': end_time,
+                    #         'time_period': time_period
+                    #     }
+                    latest_metadata.append({
+                            "track_id": track_id,
+                            "emp_id":emp_id,
+                            "name":name,
+                            "area": area_name,
+                            "start_time": start_time,
+                            "end_time": end_time,
+                            "time_period": time_period
+                        })
 
                     # Draw bounding box and labels
                     color = get_unique_color(track_id)
                     cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
                     cv2.putText(frame, name, (xmin, ymin - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, WHITE, 2)
 
-                with open("detected_objects.json", "w") as f:
-                    json.dump(detected_objects, f, indent=4)
+                # with open("detected_objects.json", "w") as f:
+                #     json.dump(detected_objects, f, indent=4)
+                # if latest_metadata:
+                #         with Session_() as session:
+                #             for data in latest_metadata:
+                #                 record = DetectedLog(
+                #                     track_id=data["track_id"],
+                #                     emp_id=data["emp_id"],
+                #                     name=data["name"],
+                #                     area=data["area"],
+                #                     start_time=data["start_time"],
+                #                     end_time=data["end_time"],
+                #                     time_period=data["time_period"]
+                #                 )
+                #                 session.add(record)
+                #             session.commit()
+                if latest_metadata:
+                    with Session_() as session:
+                        for data in latest_metadata:
+                            track_id = data["track_id"]
+                            # Check if the record already exists
+                            record = session.query(DetectedLog).filter(DetectedLog.track_id==str(track_id)).first()
+                             
+                            if record:
+                                # Update the record
+                                record.emp_id = data["emp_id"]
+                                record.name = data["name"]
+                                record.area = data["area"]
+                                record.start_time = data["start_time"]
+                                record.end_time = data["end_time"]
+                                record.time_period = data["time_period"]
+                            else:
+                                # Create a new record
+                                new_record = DetectedLog(
+                                    track_id=track_id,
+                                    emp_id=data["emp_id"],
+                                    name=data["name"],
+                                    area=data["area"],
+                                    start_time=data["start_time"],
+                                    end_time=data["end_time"],
+                                    time_period=data["time_period"]
+                                )
+                                session.add(new_record)
+                        session.commit()
+
+                # if latest_metadata:
+                #         with Session_() as session:
+                #             for data in latest_metadata:
+                #                 record = DetectedLog(
+                #                     track_id=data["track_id"],
+                #                     emp_id=data["emp_id"],
+                #                     name=data["name"],
+                #                     area=data["area"],
+                #                     start_time=data["start_time"],
+                #                     end_time=data["end_time"],
+                #                     time_period=data["time_period"]
+                #                 )
+                #                 session.add(record)
+                #             session.commit()
                 # Encode frame for streaming
                 ret, buffer = cv2.imencode('.jpg', frame)
                 if ret:
@@ -301,7 +388,6 @@ def generate_frames(rtsp_link, yolo_model):
     finally:
         fresh_frame.stop()
         print("Released video capture resource")
-
 
 def frame_to_base64(frame):
     _, buffer = cv2.imencode('.jpg', frame)
@@ -331,15 +417,15 @@ def recognize_faces(frame, faces, rtsp_link, area_name, similarity_threshold=0.1
             # recognized_count += 1 
             emp_id, company, name, department, seat = results
             label = f"{name} - {company}" if company else name
-            cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 255, 0), 2)
-            cv2.putText(frame, label, (bbox[0], bbox[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            # cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 255, 0), 2)
+            # cv2.putText(frame, label, (bbox[0], bbox[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
     
-            return frame, name, emp_id, area_name, recognized 
+            return name, emp_id, area_name, recognized 
         if not recognized:
-            cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 0, 255), 2)
-            cv2.putText(frame, "Unknown", (bbox[0], bbox[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            # cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 0, 255), 2)
+            # cv2.putText(frame, "Unknown", (bbox[0], bbox[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
             
-            return frame, "Unknown", None, area_name, recognized 
+            return "Unknown", None, area_name, recognized 
 
 
 @app.get("/")
