@@ -1,0 +1,87 @@
+import pandas as pd
+import json
+from datetime import datetime
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+import pytz
+
+# Database setup
+from sqlalchemy.ext.declarative import declarative_base
+
+Base = declarative_base()
+engine_ = create_engine('postgresql://cvdemo:cvdemo@172.16.200.229:31937/mydb')
+Session_ = sessionmaker(bind=engine_)
+kolkata_zone = pytz.timezone('Asia/Kolkata')
+
+def parse_time(time_str):
+    return datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+
+def is_overlapping(period1, period2):
+    start1, end1 = period1
+    start2, end2 = period2
+    return max(start1, start2) <= min(end1, end2)
+
+def merge_periods(period1, period2):
+    start1, end1 = period1
+    start2, end2 = period2
+    return min(start1, start2), max(end1, end2)
+
+def process_database(query, output_json):
+    # Read data from the database query into a DataFrame
+    df = pd.read_sql(query, con=engine_)
+
+    # Convert times to datetime
+    df['start_time'] = pd.to_datetime(df['start_time'])
+    df['end_time'] = pd.to_datetime(df['end_time'])
+
+    # Group by name and emp_id
+    grouped = df.groupby(['name', 'emp_id'])
+
+    result = []
+
+    for (name, emp_id), group in grouped:
+        # Sort by start_time
+        group = group.sort_values('start_time')
+
+        # Process entries for overlapping times
+        merged_entries = []
+
+        for _, row in group.iterrows():
+            start_time = row['start_time']
+            end_time = row['end_time']
+            period = (start_time, end_time)
+
+            if not merged_entries:
+                merged_entries.append(period)
+            else:
+                last_period = merged_entries[-1]
+                if is_overlapping(last_period, period):
+                    merged_entries[-1] = merge_periods(last_period, period)
+                else:
+                    merged_entries.append(period)
+
+        # Create a dictionary for the current employee
+        entry = {
+            'emp_id': emp_id,
+            'name': name,
+            'detected_count': len(merged_entries)
+        }
+
+        # Add each time period with a unique key
+        for idx, (start_time, end_time) in enumerate(merged_entries, start=1):
+            entry[f'count_{idx}'] = {
+                'start_time': start_time.strftime("%Y-%m-%d %H:%M:%S"),
+                'end_time': end_time.strftime("%Y-%m-%d %H:%M:%S"),
+                'time_period': str(end_time - start_time).split(' ')[-1]  # Remove days part
+            }
+
+        result.append(entry)
+
+    # Write result to JSON file
+    with open(output_json, 'w') as json_file:
+        json.dump(result, json_file, indent=4)
+
+# Example usage
+query = "SELECT emp_id, name, start_time, end_time FROM detected_logs"  # Replace with your table and column names
+output_json = "/Users/xs496-jassin/Desktop/Surveillance/output_data.json"  # Replace with your desired JSON file path
+process_database(query, output_json)
